@@ -30,7 +30,8 @@ const OfflinePackets = {
 const BitFlags = {
 	Valid: 0x80,
 	Ack: 0x40,
-	Nack: 0x20
+	Nack: 0x20,
+	Split: 0x10
 }
 
 // We use let because we need the socket variable just in this scope
@@ -169,10 +170,132 @@ class Binary {
 		this.buffer = Buffer.concat([this.buffer, Buffer.from(s, 'utf-8')])
 		this.offset += len
 	}
+
+	readLTriad() {
+		return this.buffer.readUIntLE((this.offset += 3) - 3, 3)
+	}
+
+	writeLTriad(t) {
+        let buffer = Buffer.alloc(3);
+        buf.writeUIntLE(t, 0, 3);
+        this.buffer = Buffer.concat([this.buffer, buffer])
+        this.offset += 3
+    }
+	
+	readInt() {
+        return this.buffer.readInt32BE((this.offset += 4) - 4)
+    }
+
+	writeInt(i) {
+        let buffer = Buffer.alloc(4)
+        buffer.writeInt32BE(i)
+        this.buffer = Buffer.concat([this.buffer, buffer])
+        this.offset += 4
+    }
 }
 
 // Packet object containing the offset of the buffer and other stuff we may need
+const PacketReliability = {
+	Unreliable: 0,
+	UnreliableSequenced: 1,
+	Reliable: 2,
+	ReliableOrdered: 3,
+	ReliableSequenced: 4,
+	UnreliableWithAckReceipt: 5,
+	ReliableWithAckReceipt: 6,
+	ReliableOrderedWithAckReceipt: 7
+}
 class Packet extends Binary {
+
+	// Decodeds an encapsulated packet
+	readDatagram() {
+		let header = this.readByte()
+		this.split = (header&BitFlags.Split) !== 0
+		this.reliability = (header&224) >> 5
+		let packetLength = this.readShort()
+		packetLength >>= 3
+		if (packetLength == 0) {
+			throw new Error("Packet length cannot be 0")
+		}
+
+		if (this.reliable()) {
+			this.messageIndex = this.readLTriad()
+		}
+
+		if (this.sequenced()) {
+			this.sequenceIndex = this.readLTriad()
+		}
+
+		if (this.sequencedOrOrdered()) {
+			this.orderIndex = this.readLTriad()
+			this.readByte()  // skip order channel
+		}
+
+		if (this.split) {
+			this.splitCount = this.readLong()
+			this.splitIndex = this.readLong()
+			this.splitID = this.readShort()
+		}
+
+		this.content = new Binary(this.buffer.slice(this.offset, this.offset + packetLength))
+	}
+
+	writeDatagram() {
+		this.readDatagram()
+		console.log(this)
+		let header = this.reliability << 5
+		if (this.split) {
+			header |= BitFlags.Split
+		}
+		this.writeByte(header)	
+		// this.content wtf is undefined
+		this.writeShort((this.content.buffer.length) << 3)
+		if (this.reliable()) {
+			this.writeLTriad(this.messageIndex)
+		}
+		if (this.sequenced()) {
+			this.writeLTriad(sequenceIndex)
+		}
+		if (this.sequencedOrOrdered()) {
+			this.writeLTriad(this.orderIndex)
+			this.writeByte(0)  // skip order channel
+		}
+
+		if (this.split) {
+			this.writeLong(this.splitCount)
+			this.writeLong(this.splitIndex)
+			this.writeShort(this.splitID)
+		}
+	}
+
+	// Returns if the packet is reliable
+	reliable() {
+		if (this.reliability === PacketReliability.Reliable ||
+			this.reliability === PacketReliability.ReliableOrdered ||
+			this.reliability === PacketReliability.ReliableSequenced) {
+			return true
+		}
+		return false
+	}
+
+	// Returns if the packet is sequenced or ordered 
+	sequencedOrOrdered() {
+		if (this.reliability === PacketReliability.UnreliableSequenced ||
+			this.reliability === PacketReliability.ReliableOrdered ||
+			this.reliability === PacketReliability.ReliableSequenced) {
+			return true
+		}
+		return false
+	}
+
+	// Returns if the packet is sequenced  
+	sequenced() {
+		if (this.reliability === PacketReliability.UnreliableSequenced ||
+			this.reliability === PacketReliability.ReliableSequenced) {
+			return true
+		}
+		return false
+	}
 
 	// Writes a ipv4 (at the moment) address into buffer
 	writeAddress(address) {
@@ -330,6 +453,15 @@ class OpenConnectionReply2 extends OfflinePacket {
 
 // This class handles a player connection after offline packets
 const RESEND_REQUEST_THRESHOLD = 10
+const ConnectedPackets = {
+	ConnectionRequest: 0x09,
+	ConnectionRequestAccepted: 0x10,
+	NewIncomingConnection: 0x13,
+	ConnectedPing: 0x00,
+	ConnectedPong: 0x03,
+	DisconnectNotification: 0x15
+}
+const PacketAdditionalSize = 1 + 3 + 1 + 2 + 3 + 3 + 1
 class Connection {
 
 	constructor(client, address, mtuSize, id) {
@@ -339,6 +471,12 @@ class Connection {
 
 		this.client = client
 		this.address = address  // remoteInfo
+
+		this.connected = false
+
+		this.lastSequenceNumber = 0
+		this.nackQueue = []  // array that includes sequenceNumbers
+		this.ackQueue = []  // array that includes sequenceNumbers
 
 		this.sendSequenceNumber = 0
 		this.sendOrderIndex = 0
@@ -352,16 +490,10 @@ class Connection {
 
 		this.splits = new Map()
 
-		this.datagramRecvQueue = new OrderedQueue()
-
-		this.datagramsReceived = []
-
-		this.missingDatagramTimes = 0
-
-		this.packetQueue = new OrderedQueue()
+		this.packetQueue = new PacketQueue()
 		this.lastPacketTime = 0
 
-		this.recoveryQueue = new OrderedQueue()
+		this.recoveryQueue = new PacketQueue()
 	}
 
 	receive(message) {
@@ -383,80 +515,146 @@ class Connection {
 
 	receiveDatagram(datagram) {
 		let sequenceNumber = datagram.buffer.readUIntLE((datagram.offset += 3) - 3, 3)
-		this.datagramRecvQueue.put(sequenceNumber, true)
-		this.datagramsReceived.push(sequenceNumber)
-		let out = this.datagramRecvQueue.takeOut()
-		if (out.length == 0) {
-			this.missingDatagramTimes++
-			if (this.missingDatagramTimes >= RESEND_REQUEST_THRESHOLD) {
 
+		if (this.nackQueue.includes(sequenceNumber)) {
+			let index = this.nackQueue.indexOf(sequenceNumber)
+			this.nackQueue.splice(index, 1)
+		}
+
+		// To have a right order, logically every difference must be 1
+		let diff = sequenceNumber - this.lastSequenceNumber
+
+		// Add into nack queue lost packets
+		if (diff !== 1) {
+			for (let i = this.lastSequenceNumber + 1; i < sequenceNumber; i++) {
+				this.nackQueue.push(i)
+			}
+		}
+
+		// Check if it's an invalid packet
+		if (datagram.buffer.length > 0) {
+			// Should i set it just when diff is right (equals to 1)
+			this.lastSequenceNumber = sequenceNumber  // update last sequence number
+
+			// Decode packet data
+			datagram.readDatagram()
+
+			// If the packet has split because of mtu size, we should save packet parts
+			if (datagram.split) {
+				this.handleSplitPacket(datagram)
+			} else {
+				this.receivePacket(datagram)
 			}
 		}
 	}
 
-	sendNACK(packets...) {
-		let ack = {packets: packets}
-		let buffer = new Packet()
-		buffer.writeACK()
+	// Handles a splitted datagram packet
+	handleSplitPacket(datagram) {
+
+	}
+
+	receivePacket(packet) {
+		if (packet.reliability !== PacketReliability.ReliableOrdered) {
+			// Skip queue and handle immediately if it isn't a reliable ordered
+			return this.handlePacket(packet.content)
+		}
+
+		// TODO: queues
+		this.handlePacket(packet.content)
+	}
+
+	handlePacket(packet) {
+		let id = packet.readByte()
+
+		// Used for connection time out
+		this.lastPacketTime = Date.now()
+
+		switch(id) {
+			case ConnectedPackets.ConnectionRequest:
+				if (this.connected) {
+					return
+				}
+				return this.handleConnectionRequest(packet)
+			case ConnectedPackets.ConnectionRequestAccepted:
+				if (this.connected) {
+					return
+				}
+				return this.handleConnectionRequestAccepted(packet)
+			case ConnectedPackets.ConnectedPing:
+				return this.handleConnectedPing(packet)
+			case ConnectedPackets.ConnectedPong:
+				return this.handleConnectedPong(packet)
+			case ConnectedPackets.DisconnectNotification:
+				return this.handleDisconnectNotification(packet)
+			case 0x04:
+				return
+			default:
+				// TODO
+				console.log("We got into a todo :P")				
+		}
+	}
+
+	handleConnectionRequest(packet) {
+		let decodedPk = new ConnectionRequest(packet.buffer)
+		decodedPk.read()
+		let encodedPk = new ConnectionRequestAccepted(this.address, decodedPk.requestTimeStamp, Math.floor(Date.now() / 1000))
+		encodedPk.write()
+		let datagramPk = new Packet(encodedPk.buffer)
+		datagramPk.writeDatagram()
+		socket.send(datagramPk.buffer, 0, datagramPk.buffer.length, this.address.port, this.address.address)
+	}
+
+	handleDisconnectNotification(packet) {
+		return  // TODO
+	}
+
+	split(packet) {
+		let maxSize = (this.mtuSize - PacketAdditionalSize) - 28
+		let contentLength = packet.buffer.length  // check this
+	}
+}
+
+
+// Server -> client
+class ConnectionRequest extends Packet {
+
+	read() {
+		this.readByte() // skip PID
+		this.clientGUID = this.readLong()
+		this.requestTimeStamp = this.readLong()
+		this.secure = this.readByte()
+	}
+}
+
+// Client -> server
+class ConnectionRequestAccepted extends Packet {
+
+	constructor(clientAddress, requestTimeStamp, acceptedTimestamp) {
+		super()
+		this.clientAddress = clientAddress
+		let sysAddresses = []
+		for (let i = 0; i < 20; i++) {
+			sysAddresses[i] = {address: '0.0.0.0', port: 19132, version: 4}
+		}
+		this.systemAddresses = sysAddresses
+		this.requestTimeStamp = requestTimeStamp
+		this.acceptedTimestamp = acceptedTimestamp
+	}
+
+	write() {
+		this.writeByte(ConnectedPackets.ConnectionRequestAccepted)
+		this.writeAddress(this.clientAddress)
+		this.writeShort(0)  // unknown
+		for (let i = 0; i < this.systemAddresses; i++) {
+			this.writeAddress(this.systemAddresses[i])
+		}
+		this.writeLong(this.requestTimeStamp)
+		this.writeLong(this.acceptedTimestamp)
 	}
 }
 
 // This class holds packet queues
-class OrderedQueue {
+class PacketQueue extends Map {
 
-	constructor() {
-		this.queue = new Map()
-		this.timestamps = new Map()
-		this.lowestIndex = 0
-		this.highestIndex = 0
-		this.lastClean = Date.now()
 
-		this.zeroRecv = false
-
-		this.ptr = 0
-	}
-
-	put(index, value) {
-		if (index == 0) {
-			this.zeroRecv = true
-		}
-		if (index < this.lowestIndex) {
-			return new Error("cannot set value at index %s: already taken out", index)
-		}
-		if (this.queue.has(index)) {
-			throw new Error("cannot set value at index %v: already has a value", index)
-		}
-		if (index+1 > this.queue.highestIndex) {
-			this.highestIndex = index + 1
-		}
-		this.queue.set(index, value)
-		this.timestamps.set(index, Date.now())
-	}
-
-	takeOut() {
-		let values = []
-		let index = 0
-		for (index = this.lowestIndex; index < this.highestIndex; index++) {
-			let value = this.queue.get(index)
-			this.queue.remove(index)
-			this.timestamps.remove(index)
-			if (value == null) {
-				continue
-			}
-			values.push(value)
-		}
-		this.lowestIndex = index
-		return values
-	}
-
-	missing() {
-		let indices = []
-		for (let index = this.lowestIndex; index < this.highestIndex; index++) {
-			if (this.queue.has(index)) {
-				indices.push(index)
-				this.queue.set(index, null)
-			}
-		}
-		return indices
-	}
 }
