@@ -50,7 +50,7 @@ socket.on('listening', function() {
 })
 
 // Bind the socket 
-socket.bind(PORT, HOST);
+socket.bind(PORT, HOST)
 
 // Listen for packets
 // msg -> Buffer instance (contains a buffer with packet data)
@@ -112,10 +112,11 @@ function handleOpenConnectionRequest2(msg, address) {
 class Binary {
 
 	// PERSONAL NOTES (used to increase buffer offset)
-	// int 8 => 1 byte
-	// int16 => 2 bytes 
-	// int32 => 4 bytes
-	// int64 => 8 bytes
+	// int 8 => 1 byte => boolean 
+	// int16 => 2 bytes => short
+	// int24 => 3 bytes => triad
+	// int32 => 4 bytes => int
+	// int64 => 8 bytes => long
 
 	constructor(buffer = Buffer.alloc(0), offset = 0) {
 		this.buffer = buffer
@@ -176,8 +177,8 @@ class Binary {
 	}
 
 	writeLTriad(t) {
-        let buffer = Buffer.alloc(3);
-        buf.writeUIntLE(t, 0, 3);
+        let buffer = Buffer.alloc(3)
+        buffer.writeUIntLE(t, 0, 3)
         this.buffer = Buffer.concat([this.buffer, buffer])
         this.offset += 3
     }
@@ -205,6 +206,11 @@ const PacketReliability = {
 	ReliableWithAckReceipt: 6,
 	ReliableOrderedWithAckReceipt: 7
 }
+const MaxAcknowledgementPackets = 4096
+const RecordTypes = {
+	Range: 0,
+	Single: 1
+}
 class Packet extends Binary {
 
 	// Decodeds an encapsulated packet
@@ -215,7 +221,8 @@ class Packet extends Binary {
 		let packetLength = this.readShort()
 		packetLength >>= 3
 		if (packetLength == 0) {
-			throw new Error("Packet length cannot be 0")
+			// throw new Error("Packet length cannot be 0")
+			// SHIT connected ping addicted... has 0 as short
 		}
 
 		if (this.reliable()) {
@@ -240,9 +247,8 @@ class Packet extends Binary {
 		this.content = new Binary(this.buffer.slice(this.offset, this.offset + packetLength))
 	}
 
+	// Encapsulates a packet
 	writeDatagram() {
-		this.readDatagram()
-		console.log(this)
 		let header = this.reliability << 5
 		if (this.split) {
 			header |= BitFlags.Split
@@ -265,6 +271,40 @@ class Packet extends Binary {
 			this.writeLong(this.splitCount)
 			this.writeLong(this.splitIndex)
 			this.writeShort(this.splitID)
+		}
+
+		// Append content to the encoding
+		this.buffer = Buffer.concat([this.buffer, this.content.buffer])
+	}
+
+	readACK() {
+		let recordCount = this.readShort()
+		this.packets = []
+		for (let i = 0; i < recordCount; i++) {
+			let recordType = this.readByte()
+			switch (recordType) {
+				case RecordTypes.Range:
+					let start = this.readLTriad()
+					let end = this.readLTriad()
+
+					// Bruh... lazy to make new class just for ACKs and NACKs
+					for (let pack = start; pack <= end; pack++) {
+						this.packets.push(pack)
+
+						if (this.packets.length > MaxAcknowledgementPackets) {
+							console.log(this.packets.length)
+							throw new Error('maximum amount of packets in acknowledgement exceeded')
+						}
+					}
+
+				case RecordTypes.Single:
+					let packet = this.readLTriad()
+					this.packets.push(packet)
+
+					if (this.packets.length > MaxAcknowledgementPackets) {
+						throw new Error('maximum amount of packets in acknowledgement exceeded')
+					}
+			}
 		}
 	}
 
@@ -355,7 +395,7 @@ class OfflinePacket extends Packet {
 	}
 
 	isValid() {
-        return Buffer.from(this.magic).equals(Buffer.from(MAGIC, 'binary'));
+        return Buffer.from(this.magic).equals(Buffer.from(MAGIC, 'binary'))
     }
 }
 
@@ -462,6 +502,7 @@ const ConnectedPackets = {
 	DisconnectNotification: 0x15
 }
 const PacketAdditionalSize = 1 + 3 + 1 + 2 + 3 + 3 + 1
+const SplitAdditionalSize = 4 + 2 + 4
 class Connection {
 
 	constructor(client, address, mtuSize, id) {
@@ -494,6 +535,26 @@ class Connection {
 		this.lastPacketTime = 0
 
 		this.recoveryQueue = new PacketQueue()
+
+		this.datagramRecvQueue = new PacketQueue()
+		this.datagramsReceived = []
+		this.missingDatagramTimes = 0
+
+		this.startTicking()
+	}
+
+	startTicking() {
+        let ticker = setInterval(() => {
+        	if (this.lastPacketTime > 7) {
+        		// console.log('Timeout')
+        		// this.close()  TODO
+        	}
+        	this.checkResend()
+        }, 1 / 100 * 1000)
+
+        let pingTicker = setInterval(() => {
+			// this.sendPing()
+        }, 60 * 4)
 	}
 
 	receive(message) {
@@ -504,10 +565,10 @@ class Connection {
 			return
 		}
 
-		if (headerFlags&BitFlags.Ack !== 0) {
-			// TODO return this.handleACK(message)
-		} else if (headerFlags&BitFlags.Nack !== 0) {
-			// TODO return this.handleNACK(message)
+		if (headerFlags&BitFlags.Ack) {
+			return this.handleACK(packet)
+		} else if (headerFlags&BitFlags.Nack) {
+			//return this.handleNACK(packet)
 		} else {
 			return this.receiveDatagram(packet)
 		}
@@ -516,19 +577,19 @@ class Connection {
 	receiveDatagram(datagram) {
 		let sequenceNumber = datagram.buffer.readUIntLE((datagram.offset += 3) - 3, 3)
 
-		if (this.nackQueue.includes(sequenceNumber)) {
-			let index = this.nackQueue.indexOf(sequenceNumber)
-			this.nackQueue.splice(index, 1)
+		if (this.datagramRecvQueue.put(sequenceNumber, true)) {
+			// FUCK
+			// throw new Error("Error handing datagram: datagram already received")
 		}
-
-		// To have a right order, logically every difference must be 1
-		let diff = sequenceNumber - this.lastSequenceNumber
-
-		// Add into nack queue lost packets
-		if (diff !== 1) {
-			for (let i = this.lastSequenceNumber + 1; i < sequenceNumber; i++) {
-				this.nackQueue.push(i)
+			
+		this.datagramsReceived.push(sequenceNumber)
+		if (this.datagramRecvQueue.takeOut().length == 0) {
+			this.missingDatagramTimes++
+			if (this.missingDatagramTimes >= RESEND_REQUEST_THRESHOLD) {
+				// TODO: send NACK for every missing packet
 			}
+		} else {
+			this.missingDatagramTimes = 0
 		}
 
 		// Check if it's an invalid packet
@@ -550,7 +611,25 @@ class Connection {
 
 	// Handles a splitted datagram packet
 	handleSplitPacket(datagram) {
+		let m = this.splits.has(datagram.splitID)
+		if (m) {
+			m = this.splits.get(datagram.splitID)
+			m.set(datagram.splitIndex, datagram)
+			this.splits.set(datagram.splitID, m)
+		} else {
+			m = new Map([[datagram.splitIndex, datagram]])
+            this.splits.set(datagram.splitID, m)
+		}
 
+		// Check if we have all splits
+		if (this.splits.get(datagram.splitID).size == datagram.splitCount) {
+			let packet = new Packet()
+			for (let [splitIndex, fragment] of this.splits.get(datagram.splitID)) {
+				console.log(fragment)
+				packet.buffer = Buffer.concat([packet.buffer, fragment.buffer])
+			}
+			return this.receivePacket(packet)
+		}
 	}
 
 	receivePacket(packet) {
@@ -559,8 +638,17 @@ class Connection {
 			return this.handlePacket(packet.content)
 		}
 
-		// TODO: queues
-		this.handlePacket(packet.content)
+		// If this returns true, there was an error
+		if (this.packetQueue.put(packet.orderIndex, packet.content)) {
+			if (packet.orderIndex == 0 && !this.packetQueue.zeroRcv) {  
+				return this.handlePacket(packet.content)
+			}
+		}
+
+		// Works fine :P
+		for (let packetContent of this.packetQueue.takeOut()) {
+			this.handlePacket(packetContent)
+		}
 	}
 
 	handlePacket(packet) {
@@ -580,6 +668,8 @@ class Connection {
 					return
 				}
 				return this.handleConnectionRequestAccepted(packet)
+			case ConnectedPackets.NewIncomingConnection:
+				return this.handleNewIncomingConnection(packet)
 			case ConnectedPackets.ConnectedPing:
 				return this.handleConnectedPing(packet)
 			case ConnectedPackets.ConnectedPong:
@@ -590,7 +680,8 @@ class Connection {
 				return
 			default:
 				// TODO
-				console.log("We got into a todo :P")				
+				console.log("We got into a todo :P")
+				// console.log(packet)				
 		}
 	}
 
@@ -599,18 +690,109 @@ class Connection {
 		decodedPk.read()
 		let encodedPk = new ConnectionRequestAccepted(this.address, decodedPk.requestTimeStamp, Math.floor(Date.now() / 1000))
 		encodedPk.write()
-		let datagramPk = new Packet(encodedPk.buffer)
-		datagramPk.writeDatagram()
-		socket.send(datagramPk.buffer, 0, datagramPk.buffer.length, this.address.port, this.address.address)
+		this.write(encodedPk)
+	}
+
+	handleNewIncomingConnection(packet) {
+		this.connected = true
+		console.log('Connected')
 	}
 
 	handleDisconnectNotification(packet) {
+		console.log('DisconnectNotification')
+		this.connected = false
 		return  // TODO
 	}
 
+	handleConnectedPing(packet) {
+		let decodedPk = new ConnectedPing(packet.buffer)
+		decodedPk.read()
+		let encodedPk = new ConnectedPong(decodedPk.clientTimeStamp, Math.floor(Date.now() / 1000))
+		encodedPk.write()
+		this.write(encodedPk)
+	}
+
+	handleACK(packet)  {
+		packet.readACK()
+
+		// Mhh.. nothing to do really
+		for (let sequenceNumber of packet.packets) {
+			let p = this.recoveryQueue.take(sequenceNumber)
+			p.content = new Binary()
+		}
+	}
+
+	checkResend() {
+
+	}
+
+	sendPing() {
+		// let encodedPk = new ConnectedPing(Math.floor(Date.now() / 1000))
+		// encodedPk.write()
+		// this.write(encodedPk)
+	}
+
+	// Seems to be working, need to test with bigger packets
 	split(packet) {
 		let maxSize = (this.mtuSize - PacketAdditionalSize) - 28
 		let contentLength = packet.buffer.length  // check this
+		if (contentLength > maxSize) {
+			maxSize -= SplitAdditionalSize
+		}
+		let fragmentCount = Math.ceil(contentLength / this.mtuSize)
+		if (contentLength%maxSize !== 0) {
+			fragmentCount++
+		}
+		let fragments = new Map()
+		let offset = 0
+		for (let i = 0; i < fragmentCount; i++) {
+			let buf = packet.buffer.slice(offset, offset+=maxSize)
+			if (buf.length == 0) {
+				continue  // skip if it is 0 lenght or maybe break it directly?
+			}
+			fragments.set(i, buf) 
+		}
+		return fragments
+	}
+
+	write(packet) {
+		// if split works, this works as well
+		let fragments = this.split(packet)
+		for (let[splitIndex, content] of fragments) {
+			let sequenceNumber = this.sendSequenceNumber
+			this.sendSequenceNumber++
+			let messageIndex = this.sendMessageIndex 
+			this.sendMessageIndex++
+
+			let binary = new Binary()
+			binary.writeByte(BitFlags.Valid)
+			binary.writeLTriad(sequenceNumber)
+
+			let packet = new Packet(binary.buffer)
+			if (typeof packet.content !== "undefined") {
+				packet.content = new Binary(Buffer.concat([packet.content.buffer, content]))
+			} else {
+				packet.content = new Binary(content)
+			}
+
+			packet.orderIndex = this.sendOrderIndex
+			packet.messageIndex = messageIndex
+
+			if (fragments.length > 1) {
+				packet.split = true
+				packet.splitCount = fragments.size
+				packet.splitIndex = splitIndex
+				packet.splitID = splitID
+			} else {
+				packet.split = false
+			}
+
+			packet.writeDatagram()
+			socket.send(packet.buffer, 0, packet.buffer.length, this.address.port, this.address.address)
+
+			// Add recovery for the packet
+			this.recoveryQueue.put(sequenceNumber, packet)
+		}
 	}
 }
 
@@ -632,11 +814,6 @@ class ConnectionRequestAccepted extends Packet {
 	constructor(clientAddress, requestTimeStamp, acceptedTimestamp) {
 		super()
 		this.clientAddress = clientAddress
-		let sysAddresses = []
-		for (let i = 0; i < 20; i++) {
-			sysAddresses[i] = {address: '0.0.0.0', port: 19132, version: 4}
-		}
-		this.systemAddresses = sysAddresses
 		this.requestTimeStamp = requestTimeStamp
 		this.acceptedTimestamp = acceptedTimestamp
 	}
@@ -645,16 +822,120 @@ class ConnectionRequestAccepted extends Packet {
 		this.writeByte(ConnectedPackets.ConnectionRequestAccepted)
 		this.writeAddress(this.clientAddress)
 		this.writeShort(0)  // unknown
-		for (let i = 0; i < this.systemAddresses; i++) {
-			this.writeAddress(this.systemAddresses[i])
+		// For some reasons it works with just 10 addresses, source JRakNet
+		for (let i = 0; i < 20; i++) {
+			this.writeAddress({address: '0.0.0.0', port: 0, version: 4})
 		}
 		this.writeLong(this.requestTimeStamp)
 		this.writeLong(this.acceptedTimestamp)
 	}
 }
 
+// Client -> server
+// Server -> client
+class ConnectedPing extends Packet {
+
+	/* constructor(clientTimeStamp) {
+		super()
+		this.clientTimeStamp = clientTimeStamp
+	}
+
+	write() {
+		this.writeByte(ConnectedPackets.ConnectedPing)
+		this.writeLong(this.clientTimeStamp)
+	} */
+
+	read() {
+		console.log(this.buffer)
+		this.readByte() // ignore PID
+		this.clientTimeStamp = this.readLong()
+	}
+}
+
+// Server -> client
+// Client -> server
+class ConnectedPong extends Packet {
+
+	constructor(clientTimeStamp, serverTimeStamp) {
+		super()
+		this.clientTimeStamp = clientTimeStamp
+		this.serverTimeStamp = serverTimeStamp
+	}
+
+	/* read() {
+
+	} */
+
+	write() {
+		this.writeByte(ConnectedPackets.ConnectedPong)
+		this.writeLong(this.clientTimeStamp)
+		this.writeLong(this.serverTimeStamp)
+	}
+}
+
 // This class holds packet queues
+const DelayRecordCount = 40
 class PacketQueue extends Map {
 
+	constructor() {
+		super()
+		this.queue = new Map()
+		this.timestamps = new Map()
+		this.lowestIndex = 0
+		this.highestIndex = 0
+		this.lastClean = Date.now()
 
+		this.zeroRcv = false
+
+		this.ptr = 0
+		this.delays = new Map()
+	}
+
+	takeOut() {
+		let values = []
+		let index = this.lowestIndex
+		for (index; index < this.highestIndex; index++) {
+			let value = this.queue.get(index)
+			this.queue.delete(index)
+			this.timestamps.delete(index)
+			if (!value) {
+				continue
+			}
+			values.push(value)
+		}
+		this.lowestIndex = index
+		return values
+	}
+
+	put(index, value) {
+		if (index == 0) {
+			this.zeroRcv = true
+		}
+		if (index < this.lowestIndex) {
+			return true
+			// throw new Error("cannot set value at index %s: already taken out", index)
+		}
+		if (this.queue.has(index)) {
+			return true
+			// Packets can be sent multiple times... not a critial error
+			// throw new Error("cannot set value at index %s: already has a value", index)
+		}
+		if (index+1 > this.highestIndex) {
+			this.highestIndex = index + 1
+		}
+		this.queue.set(index, value)
+		this.timestamps.set(index, Date.now())
+	}
+
+	take(index) {
+		let val = this.queue.get(index)
+		this.queue.delete(index)
+		this.delays.set(this.ptr, Date.now() - this.timestamps.get(index))
+		this.ptr++
+		if (this.ptr == DelayRecordCount) {
+			this.ptr = 0
+		}
+		this.timestamps.delete(index)
+		return val
+	}
 }
